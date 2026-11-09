@@ -1,0 +1,23 @@
+// Build check of the vendored rs-matter: links rs-matter (os, openssl), the commissioner and the
+// interaction-model client the way the Matter bundle does, and runs an AES-CCM round trip, so
+// that the link resolves the BoringSSL functions of the crypto patch (PATCHES.md). A test,
+// because Soong emits build rules only for modules a product or a test suite needs.
+
+package {
+    default_applicable_licenses: ["vendor_sdv_everyware_rust_license"],
+}
+
+rust_test {
+    name: "rsm_smoke_test",
+    crate_name: "rsm_smoke",
+    srcs: ["src/lib.rs"],
+    edition: "2021",
+    host_supported: true,
+    rustlibs: [
+        "librs_matter-rsm",
+        "librs_matter_onboard-rsm",
+        "librs_matter_im_core-rsm",
+    ],
+    test_suites: ["general-tests"],
+    auto_gen_config: true,
+}
