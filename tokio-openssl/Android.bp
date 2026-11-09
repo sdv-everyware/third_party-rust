@@ -1,0 +1,30 @@
+// tokio-openssl 0.6.5 as published on crates.io (the checksums of the registry are in
+// .cargo-checksum.json), for everyware's libs/https. AOSP has the crate, but its module is
+// visible to the SDV communication SDK only. Its source uses openssl and tokio; the build
+// script only probes the OpenSSL version for cfgs that BoringSSL's openssl crate does not use.
+
+package {
+    default_applicable_licenses: ["vendor_sdv_everyware_rust_license"],
+}
+
+rust_library {
+    name: "libtokio_openssl-ew",
+    host_supported: true,
+    crate_name: "tokio_openssl",
+    cargo_env_compat: true,
+    cargo_pkg_version: "0.6.5",
+    crate_root: "src/lib.rs",
+    edition: "2018",
+    rustlibs: [
+        "libopenssl",
+        "libtokio",
+    ],
+    flags: ["--cap-lints=allow"],
+    apex_available: [
+        "//apex_available:platform",
+        "//apex_available:anyapex",
+    ],
+    product_available: true,
+    vendor_available: true,
+    min_sdk_version: "29",
+}
