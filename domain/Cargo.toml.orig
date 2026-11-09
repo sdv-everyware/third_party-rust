@@ -1,0 +1,209 @@
+[workspace]
+resolver = "3"
+members = [".", "./macros"]
+
+[workspace.package]
+authors = ["NLnet Labs <dns-team@nlnetlabs.nl>"]
+
+version = "0.12.3"
+# The MSRV is at least 4 versions behind stable (about half a year).
+rust-version = "1.87.0"
+edition = "2024"
+
+homepage = "https://nlnetlabs.nl/projects/domain/"
+repository = "https://github.com/nlnetlabs/domain/"
+keywords = ["DNS", "domain"]
+license = "BSD-3-Clause"
+
+[package]
+name = "domain"
+description = "A DNS library for Rust."
+authors.workspace = true
+
+version.workspace = true
+rust-version.workspace = true
+edition.workspace = true
+
+homepage.workspace = true
+repository.workspace = true
+keywords.workspace = true
+license.workspace = true
+
+documentation = "https://docs.rs/domain"
+
+[dependencies]
+domain-macros  = { path = "./macros", version = "=0.12.3" }
+
+# TODO: This _should_ be optional, but it is used by some record-type-specific
+# zonefile scanning code that is not gated behind a feature flag.
+jiff           = { version = "0.2.1", default-features = false }
+
+# Optional dependencies:
+arbitrary      = { version = "1.4.1", optional = true, features = ["derive"] }
+bumpalo        = { version = "3.12", optional = true }
+constant_time_eq = { version = "0.4.2", optional = true }
+octseq         = { version = "0.6.1", default-features = false }
+rand           = { version = "0.10.1", optional = true }
+arc-swap       = { version = "1.7.0", optional = true }
+bytes          = { version = "1.2", optional = true, default-features = false }
+chrono         = { version = "0.4.35", optional = true, default-features = false } # 0.4.35 deprecates Duration::seconds()
+futures-util   = { version = "0.3", optional = true }
+hashbrown      = { version = "0.17.0", optional = true, default-features = false, features = ["default-hasher", "inline-more"] }
+heapless       = { version = "0.9.2", optional = true }
+libc           = { version = "0.2.153", default-features = false, optional = true } # 0.2.79 is the first version that has IP_PMTUDISC_OMIT
+log            = { version = "0.4.22", optional = true }
+parking_lot    = { version = "0.12", optional = true }
+moka           = { version = "0.12.3", optional = true, features = ["future"] }
+openssl        = { version = "0.10.72", optional = true } # 0.10.70 upgrades to 'bitflags' 2.x
+ring           = { version = "0.17.2", optional = true }
+rustversion    = { version = "1", optional = true }
+secrecy        = { version = "0.10", optional = true }
+serde          = { version = "1.0.130", optional = true, default-features = false, features = ["derive"] }
+siphasher      = { version = "1", optional = true }
+smallvec       = { version = "1.3", optional = true }
+tokio          = { version = "1.33", optional = true, features = ["io-util", "macros", "net", "time", "sync", "rt-multi-thread" ] }
+tokio-rustls   = { version = "0.26", optional = true, default-features = false }
+tokio-stream   = { version = "0.1.17", optional = true }
+tracing        = { version = "0.1.40", optional = true, features = ["log"] }
+tracing-subscriber = { version = "0.3.18", optional = true, features = ["env-filter"] }
+
+# https://doc.rust-lang.org/stable/cargo/reference/lints.html#unused_dependencies
+[target."cfg(false)".dependencies]
+# Force proc-macro2 to at least 1.0.69 for minimal-version build
+proc-macro2    = { version = "1.0.69", optional = true }
+
+[features]
+default     = ["std", "rand"]
+
+# Support for libraries
+alloc       = ["dep:hashbrown", "jiff/alloc", "octseq/alloc", "serde?/alloc"]
+bumpalo     = ["dep:bumpalo", "std"]
+bytes       = ["dep:bytes", "octseq/bytes"]
+chrono      = ["dep:chrono"]
+heapless    = ["dep:heapless", "octseq/heapless"]
+rand        = ["dep:rand"]
+serde       = ["dep:serde", "octseq/serde"]
+smallvec    = ["dep:smallvec", "octseq/smallvec"]
+std         = ["alloc", "bumpalo?/std", "bytes?/std", "octseq/std", "jiff/std", "serde?/std"]
+tracing     = ["dep:log", "dep:tracing"]
+
+# Cryptographic backends
+ring    = ["dep:ring", "unstable-crypto-backend"]
+openssl = ["dep:openssl", "unstable-crypto-backend"]
+
+# Crate features
+net         = ["bytes", "futures-util", "rand", "std", "tokio"]
+resolv      = ["net", "smallvec", "unstable-client-transport"]
+resolv-sync = ["resolv", "tokio/rt"]
+tsig        = ["bytes", "constant_time_eq", "ring", "smallvec"]
+zonefile    = ["bytes", "serde", "std"]
+
+# Unstable features
+unstable-new = []
+unstable-client-cache = ["unstable-client-transport", "moka"]
+unstable-client-transport = ["net", "tracing"]
+unstable-crypto = ["bytes", "std"]
+unstable-crypto-sign = ["dep:secrecy", "unstable-crypto"]
+# Internal; also requires 'ring' or 'openssl' to be enabled.
+unstable-crypto-backend = ["unstable-crypto"]
+unstable-server-transport = ["arc-swap", "libc", "net", "siphasher", "tracing"]
+unstable-sign = ["dep:smallvec", "dep:serde", "tracing", "unstable-crypto-sign"]
+unstable-stelline = ["tokio/test-util", "tracing", "tracing-subscriber", "tsig", "unstable-client-transport", "unstable-server-transport", "zonefile"]
+# Also requires 'ring' or 'openssl' to be enabled.
+unstable-validator = ["zonefile", "unstable-client-transport", "unstable-crypto", "moka"]
+unstable-xfr = ["net"]
+unstable-zonetree = ["futures-util", "parking_lot", "rustversion", "serde", "std", "tokio", "tracing", "unstable-xfr", "zonefile"]
+
+# Support for testing
+arbitrary = ["dep:arbitrary"]
+
+[dev-dependencies]
+itertools         = "0.14.0"
+lazy_static       = { version = "1.4.0" }
+pretty_assertions = "1.4.1"
+rstest             = "0.26.1"
+rustls-pemfile    = { version = "2.1.2" }
+serde_test        = "1.0.130"
+serde_json        = "1.0.113"
+yaml_serde        = "0.10.3"
+socket2           = { version = "0.6.3" }
+tokio             = { version = "1.37", features = ["rt-multi-thread", "io-util", "net", "test-util"] }
+tokio-rustls      = { version = "0.26", default-features = false, features = [ "ring", "logging", "tls12" ] }
+tokio-test        = "0.4"
+tokio-tfo         = { version = "0.4.3" }
+webpki-roots      = { version = "1.0.7" }
+
+# For the "mysql-zone" example
+#sqlx = { version = "0.6", features = [ "runtime-tokio-native-tls", "mysql" ] }
+
+# For testing in integration tests:
+mock_instant = { version = "0.6.0" }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[[example]]
+name = "download-rust-lang"
+required-features = ["resolv"]
+
+[[example]]
+name = "lookup"
+required-features = ["resolv"]
+
+[[example]]
+name = "resolv-sync"
+required-features = ["resolv-sync"]
+
+[[example]]
+name = "client"
+required-features = ["std", "rand"]
+
+[[example]]
+name = "client-transports"
+required-features = ["net", "tokio-rustls", "unstable-client-transport"]
+
+[[example]]
+name = "client-cache-transport"
+required-features = ["net", "unstable-client-cache"]
+
+[[example]]
+name = "server-transports"
+required-features = ["net", "tokio-stream", "tracing-subscriber", "unstable-client-transport", "unstable-server-transport"]
+
+[[example]]
+name = "read-zone"
+required-features = ["zonefile"]
+
+[[example]]
+name = "query-zone"
+required-features = ["tracing-subscriber", "unstable-zonetree", "zonefile"]
+
+[[example]]
+name = "serve-zone"
+required-features = ["zonefile", "net", "tokio-stream", "tracing-subscriber", "tsig", "unstable-client-transport", "unstable-server-transport", "unstable-zonetree"]
+
+[[example]]
+name = "ixfr-client"
+required-features = ["zonefile", "net", "unstable-client-transport", "unstable-zonetree"]
+
+[[example]]
+name = "query-routing"
+required-features = ["net", "unstable-client-transport", "unstable-server-transport", "tracing-subscriber"]
+
+[[example]]
+name = "keyset"
+# Note that we have to pick a crypto backend eventhough the example doesn't
+# need one.
+required-features = ["serde", "unstable-sign", "ring"]
+
+# This example is commented out because it is difficult, if not impossible,
+# when including the sqlx dependency, to make the dependency tree compatible
+# with both `cargo +nightly update -Z minimal versions` and the crate minimum
+# supported Rust version (1.67 at the time of writing), both of which are
+# tested by our CI setup. To try this example, uncomment the lines below and
+# the sqlx dependency above, then run `cargo run --example mysql-zone`.
+#[[example]]
+#name = "mysql-zone"
+#path = "examples/other/mysql-zone.rs"
+#required-features = ["zonefile", "net", "unstable-server-transport", "unstable-zonetree"]

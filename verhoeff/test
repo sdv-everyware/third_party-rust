@@ -1,0 +1,10 @@
+#!/bin/sh
+set -e
+export RUSTFLAGS="-D warnings"
+for release in "" "--release"; do
+	for subcommand in clippy test doc; do
+		for features in "" "--no-default-features" "--no-default-features --features alloc"; do
+			cargo $subcommand $release $features
+		done
+	done
+done

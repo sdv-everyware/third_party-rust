@@ -1,0 +1,836 @@
+//! Types for iterating over and storing zone records in canonical sort order.
+use core::cmp::Ordering;
+use core::convert::From;
+use core::iter::Extend;
+use core::marker::{PhantomData, Send};
+use core::ops::Deref;
+use core::slice::Iter;
+
+use alloc::vec::Vec;
+use alloc::{fmt, slice};
+
+use crate::base::Ttl;
+use crate::base::cmp::CanonicalOrd;
+use crate::base::iana::{Class, Rtype};
+use crate::base::name::ToName;
+use crate::base::rdata::RecordData;
+use crate::base::record::Record;
+
+use super::error::SigningError;
+
+//------------ Sorter --------------------------------------------------------
+
+/// A DNS resource record sorter.
+///
+/// Implement this trait to use a different sorting algorithm than that
+/// implemented by [`DefaultSorter`], e.g. to use system resources in a
+/// different way when sorting.
+pub trait Sorter {
+    /// Sort the given DNS resource records.
+    ///
+    /// The imposed order should be compatible with the ordering defined by
+    /// RFC 8976 section 3.3.1, i.e. _"DNSSEC's canonical on-the-wire RR
+    /// format (without name compression) and ordering as specified in
+    /// Sections 6.1, 6.2, and 6.3 of RFC4034 with the additional provision
+    /// that RRsets having the same owner name MUST be numerically ordered, in
+    /// ascending order, by their numeric RR TYPE"_.
+    fn sort_by<N, D, F>(records: &mut Vec<Record<N, D>>, compare: F)
+    where
+        F: Fn(&Record<N, D>, &Record<N, D>) -> Ordering + Sync,
+        Record<N, D>: CanonicalOrd + Send;
+}
+
+//------------ DefaultSorter -------------------------------------------------
+
+/// The default [`Sorter`] implementation used by [`SortedRecords`].
+///
+/// The current implementation is the single threaded sort provided by Rust
+/// [`slice::sort_by()`].
+pub struct DefaultSorter;
+
+impl Sorter for DefaultSorter {
+    fn sort_by<N, D, F>(records: &mut Vec<Record<N, D>>, compare: F)
+    where
+        F: Fn(&Record<N, D>, &Record<N, D>) -> Ordering + Sync,
+        Record<N, D>: CanonicalOrd + Send,
+    {
+        records.sort_by(compare);
+    }
+}
+
+//------------ SortedRecords -------------------------------------------------
+
+/// A collection of resource records sorted for signing.
+///
+/// The sort algorithm used defaults to [`DefaultSorter`] but can be
+/// overridden by being generic over an alternate implementation of
+/// [`Sorter`].
+///
+/// All records in an RRset are required to have the same TTL. This is
+/// currently not enforced when inserting records. RRsets with records with
+/// differing TTL will cause a panic in [`sign_zone`][super::sign_zone].
+#[derive(Clone)]
+pub struct SortedRecords<N, D, Sort = DefaultSorter>
+where
+    Record<N, D>: Send,
+    Sort: Sorter,
+{
+    records: Vec<Record<N, D>>,
+
+    _phantom: PhantomData<Sort>,
+}
+
+impl<N, D, Sort> SortedRecords<N, D, Sort>
+where
+    Record<N, D>: Send,
+    Sort: Sorter,
+{
+    pub fn new() -> Self {
+        SortedRecords {
+            records: Vec::new(),
+            _phantom: Default::default(),
+        }
+    }
+
+    /// Insert a record in sorted order.
+    ///
+    /// If inserting a lot of records at once prefer [`Extend::extend()`]
+    /// instead
+    /// which will sort once after all insertions rather than once per
+    /// insertion.
+    pub fn insert(&mut self, record: Record<N, D>) -> Result<(), Record<N, D>>
+    where
+        N: ToName,
+        D: RecordData + CanonicalOrd,
+    {
+        let idx = self
+            .records
+            .binary_search_by(|stored| stored.canonical_cmp(&record));
+        match idx {
+            Ok(_) => Err(record),
+            Err(idx) => {
+                self.records.insert(idx, record);
+                Ok(())
+            }
+        }
+    }
+
+    /// Remove all records matching the owner name, class, and rtype.
+    /// Class and Rtype can be None to match any.
+    ///
+    /// Returns:
+    ///   - true: if one or more matching records were found (and removed)
+    ///   - false: if no matching record was found
+    pub fn remove_all_by_name_class_rtype(
+        &mut self,
+        name: &N,
+        class: Option<Class>,
+        rtype: Option<Rtype>,
+    ) -> bool
+    where
+        N: ToName + Clone,
+        D: RecordData,
+    {
+        let mut found_one = false;
+        loop {
+            if self.remove_first_by_name_class_rtype(name, class, rtype) {
+                found_one = true
+            } else {
+                break;
+            }
+        }
+
+        found_one
+    }
+
+    /// Remove first records matching the owner name, class, and rtype.
+    /// Class and Rtype can be None to match any.
+    ///
+    /// Returns:
+    ///   - true: if a matching record was found (and removed)
+    ///   - false: if no matching record was found
+    pub fn remove_first_by_name_class_rtype(
+        &mut self,
+        name: &N,
+        class: Option<Class>,
+        rtype: Option<Rtype>,
+    ) -> bool
+    where
+        N: ToName,
+        D: RecordData,
+    {
+        let idx = self.records.binary_search_by(|stored| {
+            // Ordering based on base::Record::canonical_cmp excluding comparison of data
+
+            if let Some(class) = class {
+                match stored.class().cmp(&class) {
+                    Ordering::Equal => {}
+                    res => return res,
+                }
+            }
+
+            match stored.owner().name_cmp(name) {
+                Ordering::Equal => {}
+                res => return res,
+            }
+
+            if let Some(rtype) = rtype {
+                stored.rtype().cmp(&rtype)
+            } else {
+                Ordering::Equal
+            }
+        });
+        match idx {
+            Ok(idx) => {
+                self.records.remove(idx);
+                true
+            }
+            Err(_) => false,
+        }
+    }
+
+    pub fn owner_rrs(&self) -> RecordsIter<'_, N, D> {
+        RecordsIter::new_from_owned(&self.records)
+    }
+
+    pub fn rrsets(&self) -> RrsetIter<'_, N, D> {
+        RrsetIter::new_from_owned(&self.records)
+    }
+
+    pub fn find_soa(&self) -> Option<Rrset<'_, N, D>>
+    where
+        N: ToName,
+        D: RecordData,
+    {
+        self.rrsets().find(|rrset| rrset.rtype() == Rtype::SOA)
+    }
+
+    pub fn find_apex_rtype(
+        &self,
+        name: &N,
+        rtype: Rtype,
+    ) -> Option<Rrset<'_, N, D>>
+    where
+        N: CanonicalOrd + ToName,
+        D: RecordData,
+    {
+        self.rrsets().find(|rrset| {
+            rrset.rtype() == rtype
+                && rrset.owner().canonical_cmp(name) == Ordering::Equal
+        })
+    }
+
+    /// Update the data of an existing record.
+    ///
+    /// Allowing records to be mutated in-place would not be safe because it
+    /// could invalidate the sort order so no general method to mutate the
+    /// records is provided.
+    ///
+    /// This method offers a limited ability to mutate records in-place
+    /// however because it only permits mutating of the resource record data
+    /// of an existing record which doesn't impact the sort order because the
+    /// data is not part of the sort key.
+    pub fn update_data<F>(&mut self, matcher: F, new_data: D)
+    where
+        F: Fn(&Record<N, D>) -> bool,
+    {
+        if let Some(rr) = self.records.iter_mut().find(|rr| matcher(rr)) {
+            *rr.data_mut() = new_data;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.records.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.records.is_empty()
+    }
+
+    pub fn iter(&self) -> Iter<'_, Record<N, D>> {
+        self.records.iter()
+    }
+
+    pub fn into_inner(self) -> Vec<Record<N, D>> {
+        self.records
+    }
+}
+
+impl<N, D, Sort> Deref for SortedRecords<N, D, Sort>
+where
+    N: Send,
+    D: Send,
+    Sort: Sorter,
+{
+    type Target = [Record<N, D>];
+
+    fn deref(&self) -> &Self::Target {
+        &self.records
+    }
+}
+
+impl<N, D, Sort> SortedRecords<N, D, Sort>
+where
+    N: ToName + Send,
+    D: RecordData + CanonicalOrd + Send,
+    Sort: Sorter,
+    SortedRecords<N, D>: From<Vec<Record<N, D>>>,
+{
+    pub fn write<W>(&self, target: &mut W) -> Result<(), fmt::Error>
+    where
+        N: fmt::Display,
+        D: RecordData + fmt::Display,
+        W: fmt::Write,
+    {
+        for record in self.records.iter().filter(|r| r.rtype() == Rtype::SOA)
+        {
+            write!(target, "{record}")?;
+        }
+
+        for record in self.records.iter().filter(|r| r.rtype() != Rtype::SOA)
+        {
+            write!(target, "{record}")?;
+        }
+
+        Ok(())
+    }
+
+    pub fn write_with_comments<W, F>(
+        &self,
+        target: &mut W,
+        comment_cb: F,
+    ) -> Result<(), fmt::Error>
+    where
+        N: fmt::Display,
+        D: RecordData + fmt::Display,
+        W: fmt::Write,
+        F: Fn(&Record<N, D>, &mut W) -> Result<(), fmt::Error>,
+    {
+        for record in self.records.iter().filter(|r| r.rtype() == Rtype::SOA)
+        {
+            write!(target, "{record}")?;
+            comment_cb(record, target)?;
+            writeln!(target)?;
+        }
+
+        for record in self.records.iter().filter(|r| r.rtype() != Rtype::SOA)
+        {
+            write!(target, "{record}")?;
+            comment_cb(record, target)?;
+            writeln!(target)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<N: Send, D: Send> Default for SortedRecords<N, D, DefaultSorter> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<N, D, Sort> From<Vec<Record<N, D>>> for SortedRecords<N, D, Sort>
+where
+    N: ToName + PartialEq + Send,
+    D: RecordData + CanonicalOrd + PartialEq + Send,
+    Sort: Sorter,
+{
+    fn from(mut src: Vec<Record<N, D>>) -> Self {
+        Sort::sort_by(&mut src, CanonicalOrd::canonical_cmp);
+        src.dedup();
+        SortedRecords {
+            records: src,
+            _phantom: Default::default(),
+        }
+    }
+}
+
+impl<N, D, Sort> FromIterator<Record<N, D>> for SortedRecords<N, D, Sort>
+where
+    N: ToName,
+    D: RecordData + CanonicalOrd,
+    N: Send,
+    D: Send,
+    Sort: Sorter,
+    Self: Extend<Record<N, D>>,
+{
+    fn from_iter<T: IntoIterator<Item = Record<N, D>>>(iter: T) -> Self {
+        let mut res = Self::new();
+        res.extend(iter);
+        res
+    }
+}
+
+impl<N, D, Sort> Extend<Record<N, D>> for SortedRecords<N, D, Sort>
+where
+    N: ToName + PartialEq,
+    D: RecordData + CanonicalOrd + PartialEq,
+    N: Send,
+    D: Send,
+    Sort: Sorter,
+{
+    fn extend<T: IntoIterator<Item = Record<N, D>>>(&mut self, iter: T) {
+        for item in iter {
+            self.records.push(item);
+        }
+        Sort::sort_by(&mut self.records, CanonicalOrd::canonical_cmp);
+        self.records.dedup();
+    }
+}
+
+//------------ OwnerRrs ------------------------------------------------------
+
+/// A set of records with the same owner name.
+///
+/// All records in an RRset are required to have the same TTL.
+#[derive(Clone)]
+pub struct OwnerRrs<'a, N, D> {
+    slice: SliceRefsOrOwned<'a, Record<N, D>>,
+}
+
+impl<'a, N, D> OwnerRrs<'a, N, D> {
+    fn new(slice: SliceRefsOrOwned<'a, Record<N, D>>) -> Self {
+        OwnerRrs { slice }
+    }
+
+    pub fn owner(&self) -> &N {
+        self.slice.first().expect("should exist").owner()
+    }
+
+    pub fn class(&self) -> Class {
+        self.slice.first().expect("should exist").class()
+    }
+
+    pub fn rrsets(&self) -> OwnerRrsIter<'a, N, D> {
+        OwnerRrsIter::new(self.slice.clone())
+    }
+
+    pub fn records(&self) -> SliceRefsOrOwnedIterator<'a, Record<N, D>> {
+        self.slice.iter()
+    }
+
+    pub fn is_zone_cut(&self, apex: &N) -> bool
+    where
+        N: ToName + PartialEq,
+        D: RecordData,
+    {
+        self.owner().ne(apex)
+            && self.records().any(|record| record.rtype() == Rtype::NS)
+    }
+
+    pub fn is_in_zone(&self, apex: &N) -> bool
+    where
+        N: ToName,
+    {
+        self.owner().ends_with(&apex)
+    }
+}
+
+//------------ Rrset ---------------------------------------------------------
+
+/// A set of records with the same owner name, class, and record type.
+#[derive(Clone, Debug)]
+pub struct Rrset<'a, N, D> {
+    slice: SliceRefsOrOwned<'a, Record<N, D>>,
+}
+
+impl<'a, N, D> Rrset<'a, N, D>
+where
+    D: RecordData,
+{
+    /// Create new Rrset from a SliceRefsOrOwned.
+    ///
+    /// All records in an RRset are required to have the same TTL.
+    ///
+    /// # Panic
+    ///
+    /// This function panics if the records in `slice` do not all have the
+    /// same TTL.
+    pub fn new(
+        slice: SliceRefsOrOwned<'a, Record<N, D>>,
+    ) -> Result<Self, SigningError> {
+        if slice.is_empty() {
+            Err(SigningError::EmptyRecordSlice)
+        } else {
+            // This should not panic but return an error if check_ttl
+            // fails. However, other code cannot handle errors.
+            Rrset::check_ttls(&slice).expect("TTLs should be the same");
+            Ok(Rrset { slice })
+        }
+    }
+
+    /// Create new Rrset from a slice of references.
+    ///
+    /// All records in an RRset are required to have the same TTL.
+    ///
+    /// # Panic
+    ///
+    /// This function panics if the records in `slice` do not all have the
+    /// same TTL.
+    pub fn new_from_refs(
+        slice: &'a [&Record<N, D>],
+    ) -> Result<Self, SigningError> {
+        if slice.is_empty() {
+            Err(SigningError::EmptyRecordSlice)
+        } else {
+            let slice = SliceRefsOrOwned::new_from_refs(slice);
+
+            // This should not panic but return an error if check_ttl
+            // fails. However, other code cannot handle errors.
+            Rrset::check_ttls(&slice).expect("TTLs should be the same");
+
+            Ok(Rrset { slice })
+        }
+    }
+
+    /// Create new Rrset from a slice of owned records.
+    ///
+    /// All records in an RRset are required to have the same TTL.
+    ///
+    /// # Panic
+    ///
+    /// This function panics if the records in `slice` do not all have the
+    /// same TTL.
+    pub fn new_from_owned(
+        slice: &'a [Record<N, D>],
+    ) -> Result<Self, SigningError> {
+        if slice.is_empty() {
+            Err(SigningError::EmptyRecordSlice)
+        } else {
+            let slice = SliceRefsOrOwned::new_from_owned(slice);
+
+            // This should not panic but return an error if check_ttl
+            // fails. However, other code cannot handle errors.
+            Rrset::check_ttls(&slice).expect("TTLs should be the same");
+
+            Ok(Rrset { slice })
+        }
+    }
+
+    pub fn owner(&self) -> &N {
+        self.slice.first().expect("should exist").owner()
+    }
+
+    pub fn class(&self) -> Class {
+        self.slice.first().expect("should exist").class()
+    }
+
+    pub fn rtype(&self) -> Rtype
+    where
+        D: RecordData,
+    {
+        self.slice.first().expect("should exist").rtype()
+    }
+
+    pub fn ttl(&self) -> Ttl {
+        self.slice.first().expect("should exist").ttl()
+    }
+
+    pub fn first(&self) -> &Record<N, D> {
+        self.slice.first().expect("should exist")
+    }
+
+    pub fn iter(&self) -> SliceRefsOrOwnedIterator<'a, Record<N, D>> {
+        self.slice.iter()
+    }
+
+    #[allow(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        self.slice.len()
+    }
+
+    pub fn into_inner(self) -> SliceRefsOrOwned<'a, Record<N, D>> {
+        self.slice
+    }
+
+    fn check_ttls(
+        slice: &SliceRefsOrOwned<'a, Record<N, D>>,
+    ) -> Result<(), SigningError> {
+        let first = slice.first().expect("slice is not empty");
+        if first.rtype() == Rtype::RRSIG {
+            // RRSIG records should not be grouped into RRsets. However,
+            // code may still try do that and ignore the RRSIG records later.
+            // Allow RRSIG records to have different TTLs.
+            return Ok(());
+        }
+        let first_ttl = first.ttl();
+        if slice.iter().any(|r| r.ttl() != first_ttl) {
+            return Err(SigningError::MultipleTtlValues);
+        }
+        Ok(())
+    }
+}
+
+//------------ RecordsIter ---------------------------------------------------
+
+/// An iterator that produces groups of records belonging to the same owner
+/// from sorted records.
+///
+/// All records in an RRset are required to have the same TTL.
+pub struct RecordsIter<'a, N, D> {
+    slice: SliceRefsOrOwned<'a, Record<N, D>>,
+}
+
+impl<'a, N, D> RecordsIter<'a, N, D> {
+    pub fn new(slice: SliceRefsOrOwned<'a, Record<N, D>>) -> Self {
+        RecordsIter { slice }
+    }
+
+    pub fn new_from_refs(slice: &'a [&Record<N, D>]) -> Self {
+        RecordsIter {
+            slice: SliceRefsOrOwned::new_from_refs(slice),
+        }
+    }
+
+    pub fn new_from_owned(slice: &'a [Record<N, D>]) -> Self {
+        RecordsIter {
+            slice: SliceRefsOrOwned::new_from_owned(slice),
+        }
+    }
+
+    pub fn first(&'a self) -> &'a Record<N, D> {
+        self.slice.first().expect("should exist")
+    }
+
+    pub fn skip_before(&mut self, apex: &N)
+    where
+        N: ToName + PartialEq,
+    {
+        while let Some(first) = self.slice.first().map(|r| r.owner()) {
+            if apex == first || first.ends_with(apex) {
+                break;
+            }
+            //self.slice = &self.slice[1..]
+            //self.slice = self.slice.index(1..)
+            self.slice = self.slice.skip_first()
+        }
+    }
+}
+
+impl<'a, N, D> Iterator for RecordsIter<'a, N, D>
+where
+    N: ToName + 'a,
+    D: RecordData + 'a,
+{
+    type Item = OwnerRrs<'a, N, D>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = self.slice.first()?;
+        let mut end = 1;
+        while let Some(record) = self.slice.get(end) {
+            if !record.owner().name_eq(first.owner()) {
+                break;
+            }
+            end += 1;
+        }
+        let (res, slice) = self.slice.split_at(end);
+        self.slice = slice;
+        Some(OwnerRrs::new(res))
+    }
+}
+
+//------------ RrsetIter -----------------------------------------------------
+
+/// An iterator that produces RRsets from sorted records.
+pub struct RrsetIter<'a, N, D> {
+    slice: SliceRefsOrOwned<'a, Record<N, D>>,
+}
+
+impl<'a, N, D> RrsetIter<'a, N, D> {
+    /// Create new RrsetIter from a slice of owned records.
+    ///
+    /// All records in an RRset are required to have the same TTL.
+    fn new_from_owned(slice: &'a [Record<N, D>]) -> Self {
+        Self {
+            slice: SliceRefsOrOwned::new_from_owned(slice),
+        }
+    }
+}
+
+impl<'a, N, D> Iterator for RrsetIter<'a, N, D>
+where
+    N: ToName + 'a,
+    D: RecordData + 'a,
+{
+    type Item = Rrset<'a, N, D>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = self.slice.first()?;
+        let mut end = 1;
+        while let Some(record) = self.slice.get(end) {
+            if !record.owner().name_eq(first.owner())
+                || record.rtype() != first.rtype()
+            {
+                break;
+            }
+            end += 1;
+        }
+        let (res, slice) = self.slice.split_at(end);
+        self.slice = slice;
+        Some(Rrset::new(res).expect("Rrset::new should not fail"))
+    }
+}
+
+//------------ OwnerRrsIter --------------------------------------------------
+
+/// An iterator that produces RRsets from a set of records with the same owner
+/// name.
+///
+/// All records in an RRset are required to have the same TTL.
+pub struct OwnerRrsIter<'a, N, D> {
+    slice: SliceRefsOrOwned<'a, Record<N, D>>,
+}
+
+impl<'a, N, D> OwnerRrsIter<'a, N, D> {
+    fn new(slice: SliceRefsOrOwned<'a, Record<N, D>>) -> Self {
+        OwnerRrsIter { slice }
+    }
+}
+
+impl<'a, N, D> Iterator for OwnerRrsIter<'a, N, D>
+where
+    N: ToName + 'a,
+    D: RecordData + 'a,
+{
+    type Item = Rrset<'a, N, D>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let first = self.slice.first()?;
+        let mut end = 1;
+        while let Some(record) = self.slice.get(end) {
+            if record.rtype() != first.rtype() {
+                break;
+            }
+            end += 1;
+        }
+        let (res, slice) = self.slice.split_at(end);
+        self.slice = slice;
+        Some(
+            Rrset::new(res).expect("res is not empty so new should not fail"),
+        )
+    }
+}
+
+//------------ SliceRefsOrOwned ----------------------------------------------
+
+/// An enum that keeps either a slice of T or a slice of &T.
+#[derive(Debug)]
+pub enum SliceRefsOrOwned<'a, T> {
+    Refs(&'a [&'a T]),
+    Owned(&'a [T]),
+}
+
+impl<'a, T> SliceRefsOrOwned<'a, T> {
+    fn new_from_refs(slice: &'a [&'a T]) -> Self {
+        Self::Refs(slice)
+    }
+
+    pub fn new_from_owned(slice: &'a [T]) -> Self {
+        Self::Owned(slice)
+    }
+
+    fn first(&self) -> Option<&T> {
+        match self {
+            SliceRefsOrOwned::Refs(slice) => slice.first().copied(),
+            SliceRefsOrOwned::Owned(slice) => slice.first(),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        match self {
+            SliceRefsOrOwned::Refs(slice) => slice.is_empty(),
+            SliceRefsOrOwned::Owned(slice) => slice.is_empty(),
+        }
+    }
+
+    // We want to do index, but that seems to hard. We mainly need to
+    // delete the first element.
+    fn skip_first(&self) -> Self {
+        match self {
+            SliceRefsOrOwned::Refs(slice) => Self::new_from_refs(&slice[1..]),
+            SliceRefsOrOwned::Owned(slice) => {
+                Self::new_from_owned(&slice[1..])
+            }
+        }
+    }
+
+    fn get(&self, i: usize) -> Option<&T> {
+        match self {
+            SliceRefsOrOwned::Refs(slice) => slice.get(i).copied(),
+            SliceRefsOrOwned::Owned(slice) => slice.get(i),
+        }
+    }
+
+    fn len(&self) -> usize {
+        match self {
+            SliceRefsOrOwned::Refs(slice) => slice.len(),
+            SliceRefsOrOwned::Owned(slice) => slice.len(),
+        }
+    }
+
+    fn split_at(&self, i: usize) -> (Self, Self) {
+        match self {
+            SliceRefsOrOwned::Refs(slice) => {
+                let (left, right) = slice.split_at(i);
+                (Self::new_from_refs(left), Self::new_from_refs(right))
+            }
+            SliceRefsOrOwned::Owned(slice) => {
+                let (left, right) = slice.split_at(i);
+                (Self::new_from_owned(left), Self::new_from_owned(right))
+            }
+        }
+    }
+
+    pub fn iter(&self) -> SliceRefsOrOwnedIterator<'a, T> {
+        match self {
+            SliceRefsOrOwned::Refs(slice) => {
+                SliceRefsOrOwnedIterator::new_from_refs(slice.iter())
+            }
+            SliceRefsOrOwned::Owned(slice) => {
+                SliceRefsOrOwnedIterator::new_from_owned(slice.iter())
+            }
+        }
+    }
+}
+
+impl<'a, T> Clone for SliceRefsOrOwned<'a, T> {
+    fn clone(&self) -> Self {
+        match self {
+            SliceRefsOrOwned::Refs(slice) => {
+                SliceRefsOrOwned::new_from_refs(slice)
+            }
+            SliceRefsOrOwned::Owned(slice) => {
+                SliceRefsOrOwned::new_from_owned(slice)
+            }
+        }
+    }
+}
+
+//------------ SliceRefsOrOwnedIterator --------------------------------------
+
+/// An iterator over either a slice of T or a slice of &T.
+#[derive(Debug)]
+pub enum SliceRefsOrOwnedIterator<'a, T> {
+    Refs(Iter<'a, &'a T>),
+    Owned(Iter<'a, T>),
+}
+
+impl<'a, T> SliceRefsOrOwnedIterator<'a, T> {
+    fn new_from_refs(iter: slice::Iter<'a, &'a T>) -> Self {
+        Self::Refs(iter)
+    }
+    fn new_from_owned(iter: slice::Iter<'a, T>) -> Self {
+        Self::Owned(iter)
+    }
+}
+
+impl<'a, T> Iterator for SliceRefsOrOwnedIterator<'a, T> {
+    type Item = &'a T;
+    fn next(&mut self) -> Option<<Self as Iterator>::Item> {
+        match self {
+            SliceRefsOrOwnedIterator::Refs(iter) => iter.next().copied(),
+            SliceRefsOrOwnedIterator::Owned(iter) => iter.next(),
+        }
+    }
+}
