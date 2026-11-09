@@ -1,0 +1,17 @@
+// rs-matter and the Rust crates it needs that AOSP does not have in a compatible version
+// (CRATES.md), and tokio-openssl for libs/https (README.md). One license module for all of
+// them: their licenses are in CRATES.md and in each crate's directory.
+
+package {
+    default_visibility: ["//visibility:public"],
+}
+
+license {
+    name: "vendor_sdv_everyware_rust_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-Apache-2.0",
+        "SPDX-license-identifier-BSD-3-Clause",
+        "SPDX-license-identifier-MIT",
+    ],
+}

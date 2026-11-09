@@ -1,0 +1,12 @@
+--- a/rs-matter/rs-matter-utils/src/epoch.rs
++++ b/rs-matter/rs-matter-utils/src/epoch.rs
+@@ -47,7 +47,8 @@
+ // Pulls in `pub const FIRMWARE_BUILD_MATTER_US: u64 = …;` written by
+ // `build.rs`. Used by `MatterState::LkgUtc` as the seed value for the
+ // Last-Known-Good UTC Time on a freshly-flashed device.
+-include!(concat!(env!("OUT_DIR"), "/build_time.rs"));
++// Soong does not run build.rs: build_time.rs is written by update-rs-matter.sh.
++include!("build_time.rs");
+ 
+ /// An enum describing the current UTC timestamp the real-time clock is aware of.
+ ///

@@ -1,0 +1,10 @@
+--- a/rs-matter/rs-matter-dm-clusters/src/lib.rs
++++ b/rs-matter/rs-matter-dm-clusters/src/lib.rs
+@@ -50,4 +50,6 @@
+     pub use strum;
+ }
+ 
+-include!(concat!(env!("OUT_DIR"), "/clusters_generated.rs"));
++// Soong does not run build.rs: the code rs_matter_codegen generates is in src/generated
++// (vendor/sdv-everyware/third_party/rust/update-rs-matter.sh).
++include!("generated/clusters_generated.rs");

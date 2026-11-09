@@ -1,0 +1,221 @@
+--- a/rs-matter/rs-matter-crypto/src/backend/openssl.rs
++++ b/rs-matter/rs-matter-crypto/src/backend/openssl.rs
+@@ -191,7 +191,8 @@
+     }
+ 
+     fn aead(&self) -> Result<Self::Aead<'_>, Error> {
+-        Ok(unsafe { Aead::new(openssl::cipher::Cipher::aes_128_ccm()) })
++        // BoringSSL has no EVP_CIPHER for AES-CCM, only the AEAD with Matter's parameters.
++        Ok(unsafe { Aead::new(&*bssl_aead::EVP_aead_aes_128_ccm_matter()) })
+     }
+ 
+     fn pub_key(&self, key: crate::CanonPkcPublicKeyRef<'_>) -> Result<Self::PublicKey<'_>, Error> {
+@@ -485,22 +486,85 @@
+ 
+ /// An AEAD implementation
+ pub struct Aead<const KEY_LEN: usize, const NONCE_LEN: usize, const TAG_LEN: usize>(
+-    &'static CipherRef,
++    &'static bssl_aead::EVP_AEAD,
+ );
+ 
++/// BoringSSL's AEAD API (openssl/aead.h). BoringSSL, the OpenSSL of Android, has AES-CCM only
++/// as an AEAD: EVP_aead_aes_128_ccm_matter (16-byte tag, L=2, the 13-byte nonce of Matter).
++/// Declared here: bssl_sys, the crate with BoringSSL's bindings, is not visible outside a few
++/// AOSP modules; the functions come from the libcrypto the openssl crate links.
++#[allow(non_camel_case_types)]
++mod bssl_aead {
++    #[repr(C)]
++    pub struct EVP_AEAD {
++        _private: [u8; 0],
++    }
++    #[repr(C)]
++    pub struct EVP_AEAD_CTX {
++        _private: [u8; 0],
++    }
++    extern "C" {
++        pub fn EVP_aead_aes_128_ccm_matter() -> *const EVP_AEAD;
++        pub fn EVP_AEAD_CTX_new(
++            aead: *const EVP_AEAD,
++            key: *const u8,
++            key_len: usize,
++            tag_len: usize,
++        ) -> *mut EVP_AEAD_CTX;
++        pub fn EVP_AEAD_CTX_free(ctx: *mut EVP_AEAD_CTX);
++        pub fn EVP_AEAD_CTX_seal(
++            ctx: *const EVP_AEAD_CTX,
++            out: *mut u8,
++            out_len: *mut usize,
++            max_out_len: usize,
++            nonce: *const u8,
++            nonce_len: usize,
++            in_: *const u8,
++            in_len: usize,
++            ad: *const u8,
++            ad_len: usize,
++        ) -> i32;
++        pub fn EVP_AEAD_CTX_open(
++            ctx: *const EVP_AEAD_CTX,
++            out: *mut u8,
++            out_len: *mut usize,
++            max_out_len: usize,
++            nonce: *const u8,
++            nonce_len: usize,
++            in_: *const u8,
++            in_len: usize,
++            ad: *const u8,
++            ad_len: usize,
++        ) -> i32;
++    }
++
++    /// An AEAD context with a key, freed on drop.
++    pub struct Ctx(pub *mut EVP_AEAD_CTX);
++
++    impl Ctx {
++        pub fn new(aead: &'static EVP_AEAD, key: &[u8], tag_len: usize) -> Option<Self> {
++            let ctx = unsafe { EVP_AEAD_CTX_new(aead, key.as_ptr(), key.len(), tag_len) };
++            (!ctx.is_null()).then_some(Self(ctx))
++        }
++    }
++
++    impl Drop for Ctx {
++        fn drop(&mut self) {
++            unsafe { EVP_AEAD_CTX_free(self.0) }
++        }
++    }
++}
++
+ impl<const KEY_LEN: usize, const NONCE_LEN: usize, const TAG_LEN: usize>
+     Aead<KEY_LEN, NONCE_LEN, TAG_LEN>
+ {
+     /// Create a new AEAD instance
+     ///
+-    /// # Arguments
+-    /// - `cipher`: The cipher to use
+-    ///
+     /// # Safety
+-    /// This function is unsafe because the caller must ensure that the
+-    /// `cipher` parameter corresponds to the `KEY_LEN`, `NONCE_LEN` and `TAG_LEN` generic parameters.
+-    unsafe fn new(cipher: &'static CipherRef) -> Self {
+-        Self(cipher)
++    /// The caller must ensure that `aead` corresponds to the `KEY_LEN`, `NONCE_LEN` and
++    /// `TAG_LEN` generic parameters.
++    unsafe fn new(aead: &'static bssl_aead::EVP_AEAD) -> Self {
++        Self(aead)
+     }
+ }
+ 
+@@ -515,29 +579,29 @@
+         data: &'a mut [u8],
+         data_len: usize,
+     ) -> Result<&'a [u8], Error> {
+-        // Most of the initialization stuff adapted from here:
+-        // https://wiki.openssl.org/images/e/e1/Evp-ccm-encrypt.c
+-
+         assert!(data_len + TAG_LEN <= data.len());
+ 
+-        let mut ctx = openssl_check!(CipherCtx::new())?;
++        let ctx = bssl_aead::Ctx::new(self.0, key.access(), TAG_LEN)
++            .expect("EVP_AEAD_CTX_new failed");
++        let mut out_len = 0;
++        // BoringSSL allows the output to alias the input exactly: in place.
++        let ok = unsafe {
++            bssl_aead::EVP_AEAD_CTX_seal(
++                ctx.0,
++                data.as_mut_ptr(),
++                &mut out_len,
++                data.len(),
++                nonce.access().as_ptr(),
++                NONCE_LEN,
++                data.as_ptr(),
++                data_len,
++                aad.as_ptr(),
++                aad.len(),
++            )
++        };
++        assert!(ok == 1, "EVP_AEAD_CTX_seal failed");
+ 
+-        openssl_check!(ctx.encrypt_init(Some(self.0), None, None))?;
+-        openssl_check!(ctx.set_key_length(KEY_LEN))?;
+-        openssl_check!(ctx.set_iv_length(NONCE_LEN))?;
+-        openssl_check!(ctx.set_tag_length(TAG_LEN))?;
+-        openssl_check!(ctx.encrypt_init(None, Some(key.access()), Some(nonce.access())))?;
+-
+-        openssl_check!(ctx.set_data_len(data_len))?;
+-
+-        openssl_check!(ctx.cipher_update(aad, None))?;
+-
+-        let mut encrypted_data_len = openssl_check!(ctx.cipher_update_inplace(data, data_len))?;
+-        encrypted_data_len += openssl_check!(ctx.cipher_final(&mut data[encrypted_data_len..]))?;
+-
+-        openssl_check!(ctx.tag(&mut data[encrypted_data_len..encrypted_data_len + TAG_LEN]))?;
+-
+-        Ok(&data[..encrypted_data_len + TAG_LEN])
++        Ok(&data[..out_len])
+     }
+ 
+     fn decrypt_in_place<'a>(
+@@ -547,42 +611,34 @@
+         aad: &[u8],
+         data: &'a mut [u8],
+     ) -> Result<&'a [u8], Error> {
+-        // Most of the initialization stuff adapted from here:
+-        // https://wiki.openssl.org/images/e/e1/Evp-ccm-encrypt.c
+-
+         if data.len() < TAG_LEN {
+             // Nothing to authenticate
+             Err(ErrorCode::InvalidData)?;
+         }
+ 
+-        let (data, tag) = data.split_at_mut(data.len() - TAG_LEN);
+-
+-        let mut ctx = openssl_check!(CipherCtx::new())?;
+-
+-        openssl_check!(ctx.decrypt_init(Some(self.0), None, None))?;
+-        openssl_check!(ctx.set_key_length(KEY_LEN))?;
+-        openssl_check!(ctx.set_iv_length(NONCE_LEN))?;
+-        openssl_check!(ctx.set_tag_length(TAG_LEN))?;
+-        openssl_check!(ctx.set_tag(tag))?;
+-
+-        openssl_check!(ctx.decrypt_init(None, Some(key.access()), Some(nonce.access())))?;
+-
+-        openssl_check!(ctx.set_data_len(data.len()))?;
+-
+-        openssl_check!(ctx.cipher_update(aad, None))?;
+-
+-        // CCM verifies the tag during the update/final step. All length/init
+-        // programming errors are already ruled out above via `openssl_check!`,
+-        // so a failure here means invalid/untrusted input (bad tag or
+-        // ciphertext) -> return it rather than panic.
+-        let mut decrypted_data_len = ctx
+-            .cipher_update_inplace(data, data.len())
+-            .map_err(|_| ErrorCode::InvalidData)?;
+-        decrypted_data_len += ctx
+-            .cipher_final(&mut data[decrypted_data_len..])
+-            .map_err(|_| ErrorCode::InvalidData)?;
++        let ctx = bssl_aead::Ctx::new(self.0, key.access(), TAG_LEN)
++            .expect("EVP_AEAD_CTX_new failed");
++        let mut out_len = 0;
++        // A failure is a bad tag or ciphertext: untrusted input, an error, not a panic.
++        let ok = unsafe {
++            bssl_aead::EVP_AEAD_CTX_open(
++                ctx.0,
++                data.as_mut_ptr(),
++                &mut out_len,
++                data.len(),
++                nonce.access().as_ptr(),
++                NONCE_LEN,
++                data.as_ptr(),
++                data.len(),
++                aad.as_ptr(),
++                aad.len(),
++            )
++        };
++        if ok != 1 {
++            Err(ErrorCode::InvalidData)?;
++        }
+ 
+-        Ok(&data[..decrypted_data_len])
++        Ok(&data[..out_len])
+     }
+ }
+ 
