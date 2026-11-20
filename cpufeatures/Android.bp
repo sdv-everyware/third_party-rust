@@ -12,8 +12,8 @@ rust_library_rlib {
     cargo_pkg_version: "0.3.1",
     crate_root: "src/lib.rs",
     edition: "2024",
-    target: {
-        android: {
+    arch: {
+        arm64: {
             rustlibs: [
                 "liblibc",
             ],

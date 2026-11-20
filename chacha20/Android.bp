@@ -19,8 +19,8 @@ rust_library_rlib {
         "libcfg_if",
         "librand_core-rsm",
     ],
-    target: {
-        host: {
+    arch: {
+        x86_64: {
             rustlibs: [
                 "libcpufeatures-rsm",
             ],
