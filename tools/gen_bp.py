@@ -140,6 +140,7 @@ def lib_target(pkg):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--metadata", required=True, help="cargo metadata for aarch64-linux-android")
+    ap.add_argument("--metadata-x86_64", help="cargo metadata for x86_64-linux-android")
     ap.add_argument("--metadata-host", required=True, help="cargo metadata for x86_64-unknown-linux-gnu")
     ap.add_argument("--vendor", required=True)
     ap.add_argument("--aosp-index", required=True)
@@ -148,16 +149,23 @@ def main():
     args = ap.parse_args()
 
     aosp = json.load(open(args.aosp_index))
-    # The dependencies are resolved for each platform a crate is built for: the device
-    # (aarch64 Android) and the host (x86-64 Linux, for the proc-macros and the host tests). A
-    # dependency some crates take only on one architecture (cpufeatures on x86) goes into
+    # The dependencies are resolved for each platform a crate is built for: the 64-bit device
+    # architectures (aarch64 and x86_64 Android) and the host (x86-64 Linux, for the proc-macros
+    # and the host tests). A dependency that varies by CPU architecture (cpufeatures on x86_64,
+    # libc in cpufeatures on arm64) goes into arch: { ... }; one that varies by OS goes into
     # target: { android | host }.
-    metas = {"android": json.load(open(args.metadata)), "host": json.load(open(args.metadata_host))}
+    metas = {"android_arm64": json.load(open(args.metadata))}
+    android_plats = ["android_arm64"]
+    if args.metadata_x86_64:
+        metas["android_x86_64"] = json.load(open(args.metadata_x86_64))
+        android_plats.append("android_x86_64")
+    metas["host"] = json.load(open(args.metadata_host))
+    all_plats = android_plats + ["host"]
     pkgs = {}
     for m in metas.values():
         pkgs.update({p["id"]: p for p in m["packages"]})
     nodes_on = {plat: {n["id"]: n for n in m["resolve"]["nodes"]} for plat, m in metas.items()}
-    root = next(p["id"] for p in metas["android"]["packages"] if p["name"] == args.root)
+    root = next(p["id"] for p in metas["android_arm64"]["packages"] if p["name"] == args.root)
 
     def normal(dep):
         return any(k["kind"] in (None, "normal") for k in dep["dep_kinds"])
@@ -188,13 +196,15 @@ def main():
     # On the device: what is reachable without going through a proc-macro (a proc-macro and its
     # dependencies run in the compiler, on the host). A crate only the proc-macros use is a
     # host library (rust_library_host), like syn and quote in AOSP.
-    device, stack = set(), [root]
-    while stack:
-        i = stack.pop()
-        if i in device or is_proc_macro(i):
-            continue
-        device.add(i)
-        stack += [d["pkg"] for d in deps_on("android", i)]
+    device = set()
+    for plat in android_plats:
+        stack = [root]
+        while stack:
+            i = stack.pop()
+            if i in device or is_proc_macro(i):
+                continue
+            device.add(i)
+            stack += [d["pkg"] for d in deps_on(plat, i)]
 
     names = {}
     for i in need:
@@ -298,7 +308,7 @@ def main():
         on_device = not proc_macro and i in device
         aliases = []
         per = {}  # platform -> (rustlibs, proc_macros)
-        for plat in (("android", "host") if on_device else ("host",)):
+        for plat in (all_plats if on_device else ("host",)):
             libs, macros = set(), set()
             for d in deps_on(plat, i):
                 if d["pkg"] not in need:
@@ -307,12 +317,37 @@ def main():
                 if d["name"] != crate_name(d["pkg"]):
                     aliases.append(f"{crate_name(d['pkg'])}:{d['name']}")
             per[plat] = (libs, macros)
+        arch_libs = {}
+        target_libs = {}
         if on_device:
-            common = per["android"][0] & per["host"][0]
-            only = {plat: per[plat][0] - common for plat in per}
-            proc_macros = per["android"][1] | per["host"][1]
+            common = set.intersection(*(per[plat][0] for plat in all_plats))
+            all_libs = set.union(*(per[plat][0] for plat in all_plats))
+            proc_macros = set.union(*(per[plat][1] for plat in all_plats))
+            if "android_x86_64" in per:
+                for lib in all_libs - common:
+                    on_a64 = lib in per["android_arm64"][0]
+                    on_ax64 = lib in per["android_x86_64"][0]
+                    on_host = lib in per["host"][0]
+                    if on_a64 and on_ax64 and not on_host:
+                        target_libs.setdefault("android", set()).add(lib)
+                    elif on_host and not on_a64 and not on_ax64:
+                        target_libs.setdefault("host", set()).add(lib)
+                    elif on_ax64 == on_host:
+                        if on_a64:
+                            arch_libs.setdefault("arm64", set()).add(lib)
+                        if on_ax64:
+                            arch_libs.setdefault("x86_64", set()).add(lib)
+                    else:
+                        for plat in all_plats:
+                            if lib in per[plat][0]:
+                                target_libs.setdefault(plat, set()).add(lib)
+            else:
+                if per["android_arm64"][0] - common:
+                    target_libs["android"] = per["android_arm64"][0] - common
+                if per["host"][0] - common:
+                    target_libs["host"] = per["host"][0] - common
         else:
-            common, only, proc_macros = per["host"][0], {}, per["host"][1]
+            common, proc_macros = per["host"][0], per["host"][1]
         rustlibs = sorted(common) + EXTRA_RUSTLIBS.get(p["name"], [])
         features = set()
         for plat in nodes_on:
@@ -355,12 +390,21 @@ def main():
         plist("rustlibs", rustlibs)
         plist("proc_macros", proc_macros)
         plist("aliases", aliases)
-        plats = sorted(set(plat for plat, libs in only.items() if libs) | set(target_cfgs))
+        if arch_libs:
+            lines.append("    arch: {")
+            for arch in sorted(arch_libs):
+                lines.append(f"        {arch}: {{")
+                lines.append("            rustlibs: [")
+                lines.extend(f'                "{v}",' for v in sorted(arch_libs[arch]))
+                lines.append("            ],")
+                lines.append("        },")
+            lines.append("    },")
+        plats = sorted(set(plat for plat, libs in target_libs.items() if libs) | set(target_cfgs))
         if plats:
             lines.append("    target: {")
             for plat in plats:
                 lines.append(f"        {plat}: {{")
-                for key, values in (("rustlibs", only.get(plat)), ("cfgs", target_cfgs.get(plat))):
+                for key, values in (("rustlibs", target_libs.get(plat)), ("cfgs", target_cfgs.get(plat))):
                     if values:
                         lines.append(f"            {key}: [")
                         lines.extend(f'                "{v}",' for v in sorted(values))
@@ -399,7 +443,7 @@ def main():
                 "    auto_gen_config: true,",
             ]
             plist("features", features)
-            plist("rustlibs", sorted(set(rustlibs) | only.get("host", set())))
+            plist("rustlibs", sorted(per["host"][0]) + EXTRA_RUSTLIBS.get(p["name"], []))
             plist("proc_macros", proc_macros)
             plist("aliases", aliases)
             lines += ['    flags: ["--cap-lints=allow"],', "}"]

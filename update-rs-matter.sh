@@ -60,6 +60,7 @@ EOF
 : > "$WORK/rsm-deps/src/lib.rs"
 (cd "$WORK/rsm-deps" && cargo generate-lockfile -q &&
     cargo metadata -q --format-version 1 --filter-platform aarch64-linux-android > "$WORK/metadata.json" &&
+    cargo metadata -q --format-version 1 --filter-platform x86_64-linux-android > "$WORK/metadata-x86_64.json" &&
     cargo metadata -q --format-version 1 --filter-platform x86_64-unknown-linux-gnu > "$WORK/metadata-host.json" &&
     cargo vendor -q --versioned-dirs "$WORK/vendor" > /dev/null)
 
@@ -68,6 +69,7 @@ python3 "$HERE/tools/aosp_index.py" "$TREE" > "$WORK/aosp-index.json"
 
 say "the crates and their Android.bp"
 python3 "$HERE/tools/gen_bp.py" --metadata "$WORK/metadata.json" \
+    --metadata-x86_64 "$WORK/metadata-x86_64.json" \
     --metadata-host "$WORK/metadata-host.json" --vendor "$WORK/vendor" \
     --aosp-index "$WORK/aosp-index.json" --out "$HERE"
 
